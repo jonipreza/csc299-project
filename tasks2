@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""
+tasks2 — Iteration: add due dates with specific times.
+
+Commands kept from tasks1: add, list, search, done
+New: --due "Nov 20, 2025 3:00 pm" (stored as ISO 8601 local time)
+
+JSON shape per task now includes:
+{
+  "id": "...",
+  "title": "...",
+  "priority": 3,
+  "done": false,
+  "due": "2025-11-20T15:00"    # absent or "" if not set
+}
+"""
+import argparse, json, os, re, time
+from datetime import datetime
+
+DEFAULT_DB = "tasks.json"   # keep your original filename unless you want tasks2.json
+
+# ---------- storage helpers ----------
+def load_db(path: str):
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        try:
+            return json.load(f)
+        except json.JSONDecodeError:
+            return []
+
+def save_db(path: str, tasks):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(tasks, f, indent=2, ensure_ascii=False)
+
+def gen_id(prefix: str = "t") -> str:
+    return f"{prefix}_{int(time.time()*1000)}"
+
+# ---------- due-date parsing & formatting ----------
+# Accept several common inputs; store as ISO "YYYY-MM-DDTHH:MM"
+_DUE_FORMATS = [
+    "%Y-%m-%d %H:%M",          # 2025-11-20 15:00
+    "%Y-%m-%d %I:%M %p",       # 2025-11-20 3:00 PM
+    "%Y-%m-%d",                # 2025-11-20  (interpreted as 00:00)
+    "%b %d, %Y %H:%M",         # Nov 20, 2025 15:00
+    "%b %d, %Y %I:%M %p",      # Nov 20, 2025 3:00 PM
+    "%B %d, %Y %H:%M",         # November 20, 2025 15:00
+    "%B %d, %Y %I:%M %p",      # November 20, 2025 3:00 PM
+]
+
+def parse_due_string(s: str) -> str:
+    """Return ISO local 'YYYY-MM-DDTHH:MM' or '' if parsing fails/empty."""
+    if not s or not s.strip():
+        return ""
+    raw = s.strip()
+    for fmt in _DUE_FORMATS:
+        try:
+            dt = datetime.strptime(raw, fmt)
+            # If user gave only a date, set 00:00
+            iso = dt.strftime("%Y-%m-%dT%H:%M")
+            return iso
+        except ValueError:
+            continue
+    # try forgiving commas/extra spaces
+    raw2 = re.sub(r"\s+", " ", raw.replace(",", " ").strip())
+    for fmt in _DUE_FORMATS:
+        try:
+            dt = datetime.strptime(raw2, fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M")
+        except ValueError:
+            continue
+    raise ValueError(
+        "Could not parse due date/time. Try formats like:\n"
+        "  2025-11-20 15:00\n"
+        "  2025-11-20 3:00 PM\n"
+        "  Nov 20, 2025 3:00 pm\n"
+        "  November 20, 2025 3:00 pm"
+    )
+
+def pretty_due(iso: str) -> str:
+    if not iso:
+        return ""
+    try:
+        dt = datetime.strptime(iso, "%Y-%m-%dT%H:%M")
+        # e.g., Thu Nov 20, 2025 03:00 PM
+        return dt.strftime("%a %b %d, %Y %I:%M %p")
+    except ValueError:
+        return iso  # if somehow malformed, just show raw
+
+# ---------- core ops ----------
+def add_task(tasks, title: str, priority: int = 3, due_str: str = ""):
+    due_iso = parse_due_string(due_str) if due_str else ""
+    t = {
+        "id": gen_id("t"),
+        "title": title.strip(),
+        "priority": int(priority),
+        "done": False,
+        "due": due_iso,
+        "created": time.time()
+    }
+    tasks.append(t)
+    return t
+
+def mark_done(tasks, task_id: str) -> bool:
+    for t in tasks:
+        if str(t.get("id")) == str(task_id):
+            t["done"] = True
+            return True
+    return False
+
+def search_tasks(tasks, query: str):
+    q = query.lower().strip()
+    if not q:
+        return []
+    words = [w for w in re.split(r"\W+", q) if w]
+    results = []
+    for t in tasks:
+        hay = " ".join([
+            t.get("title",""),
+            str(t.get("priority","")),
+            t.get("due",""),
+            "done" if t.get("done") else "open"
+        ]).lower()
+        score = sum(hay.count(w) for w in words)
+        if score > 0:
+            tt = dict(t); tt["_score"] = float(score); results.append(tt)
+    # sort by score desc, then by due (earliest first if present), then by created
+    def sort_key(x):
+        due = x.get("due") or "9999-12-31T23:59"
+        return (-x["_score"], due, x.get("created", 0))
+    results.sort(key=sort_key)
+    return results
+
+def list_tasks_sorted(tasks):
+    """List tasks with due date ascending (blank due at bottom)."""
+    def key(t):
+        due = t.get("due") or "9999-12-31T23:59"
+        return (due, t.get("created", 0))
+    return sorted(tasks, key=key)
+
+# ---------- CLI ----------
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="tasks2",
+        description="tasks2 — tasks CLI with due dates (iteration over tasks1)"
+    )
+    p.add_argument("--db", default=DEFAULT_DB, help="Path to tasks JSON (default: tasks.json)")
+    sub = p.add_subparsers(dest="cmd")
+
+    add = sub.add_parser("add", help="Add a task")
+    add.add_argument("title")
+    add.add_argument("--priority", type=int, default=3)
+    add.add_argument("--due", default="", help="e.g. 'Nov 20, 2025 3:00 pm' or '2025-11-20 15:00'")
+
+    lst = sub.add_parser("list", help="List tasks (sorted by due, then created)")
+    srch = sub.add_parser("search", help="Search tasks"); srch.add_argument("query")
+    done = sub.add_parser("done", help="Mark a task done"); done.add_argument("id")
+
+    return p
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    tasks = load_db(args.db)
+
+    if args.cmd == "add":
+        try:
+            t = add_task(tasks, args.title, priority=args.priority, due_str=args.due)
+        except ValueError as e:
+            print(str(e)); return
+        save_db(args.db, tasks)
+        print(f"Added task #{t['id']}: {t['title']}  (due: {pretty_due(t['due']) if t['due'] else '—'})")
+        return
+
+    if args.cmd == "list":
+        rows = list_tasks_sorted(tasks)
+        if not rows:
+            print("No tasks yet."); return
+        for t in rows:
+            status = "✔" if t.get("done") else " "
+            due_disp = pretty_due(t.get("due",""))
+            print(f"[{t['id']}] {status} P{t.get('priority',3)} {t.get('title','')}  due={due_disp or '—'}")
+        return
+
+    if args.cmd == "search":
+        hits = search_tasks(tasks, args.query)
+        if not hits:
+            print("No matching tasks."); return
+        for t in hits:
+            due_disp = pretty_due(t.get("due",""))
+            print(f"[{t['id']}] P{t.get('priority',3)} {t.get('title','')}  due={due_disp or '—'}  (score {t['_score']:.2f})")
+        return
+
+    if args.cmd == "done":
+        ok = mark_done(tasks, args.id)
+        save_db(args.db, tasks)
+        print("Marked done." if ok else "Task not found.")
+        return
+
+    # Default: show help
+    build_parser().print_help()
+
+if __name__ == "__main__":
+    main()
